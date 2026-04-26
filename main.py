@@ -47,6 +47,22 @@ import logging      # Sistema de logs profesional. Mucho mejor que usar print() 
                     # - Podés redirigir los logs a un archivo fácilmente
                     # - Incluye timestamp automáticamente
 
+import win32gui     # Acceso a la API de ventanas de Windows.
+                    # Nos permite buscar ventanas por nombre, obtener su posición
+                    # y dimensiones, y traerlas al frente automáticamente.
+                    # Instalación: pip install pywin32
+
+import win32process # Complemento de win32gui: nos permite obtener el PID y nombre
+                    # del proceso asociado a una ventana. Así buscamos Exnova
+                    # por nombre de .EXE y no por título de ventana (que puede cambiar).
+
+import win32con     # Constantes de la API de Windows. Las usamos para traer
+                    # la ventana de Exnova al frente (SW_RESTORE, SW_SHOW).
+
+import psutil       # Librería para inspeccionar procesos del sistema.
+                    # Nos permite buscar el PID de Exnova por nombre de .EXE.
+                    # Instalación: pip install psutil
+
 # =============================================================================
 # CONFIGURACIÓN DEL SISTEMA DE LOGS
 # =============================================================================
@@ -64,6 +80,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", # Formato del mensaje en consola
     datefmt="%H:%M:%S"                                # Solo mostramos hora:min:seg (más limpio)
 )
+
+# Silenciamos los loggers internos de librerías externas que spamean la consola.
+# Tesseract/pytesseract genera decenas de líneas DEBUG por frame — inútil para nosotros.
+# Con esto solo vemos los logs de NUESTRO código (logger "RoarBot").
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("pytesseract").setLevel(logging.WARNING)
 
 # Creamos un logger específico para este módulo.
 # Es buena práctica tener un logger por archivo/módulo.
@@ -129,10 +151,36 @@ CENTRO_RELOJ_X = AREA_RELOJ["left"] + (AREA_RELOJ["width"] // 2)  # 1403 + 35 = 
 # El triángulo puede aparecer hasta ~100px antes del centro del reloj.
 # Usamos 120px para tener margen cómodo.
 #
-# CALIBRACIÓN (ajustá si el bot falla):
-#   Bot ignora señales válidas   → aumentar (ej: 160)
-#   Bot opera sobre velas viejas → reducir  (ej: 80)
-TOLERANCIA_ZONA_PX = 120
+# Ancho de la zona válida en píxeles a la izquierda del centro del reloj.
+# Solo se detectan señales dentro de esta franja — todo lo demás se ignora.
+#
+# CALIBRACIÓN:
+#   Bot ignora señales válidas      → aumentar este número
+#   Bot detecta señales de velas viejas → reducirlo
+TOLERANCIA_ZONA_PX = 350
+
+# --- MULTI-SCALE MATCHING ---
+# El zoom de Exnova hace que los triángulos cambien de tamaño en pantalla.
+# Si el template mide 30x30px y el triángulo real mide 22x22px,
+# matchTemplate no los considera iguales y la confianza cae a casi 0.
+#
+# Solución: buscamos el template a varios tamaños (escalas).
+# Por cada escala redimensionamos el template y corremos matchTemplate.
+# Nos quedamos con la escala que dio mayor confianza dentro de la zona.
+#
+# SCALE_MIN / SCALE_MAX: rango de escalas a probar.
+#   0.7 = template al 70% de su tamaño original (triángulo pequeño en zoom out)
+#   1.3 = template al 130% de su tamaño original (triángulo grande en zoom in)
+#
+# SCALE_STEPS: cuántas escalas intermedias probar.
+#   10 pasos entre 0.7 y 1.3 = cada 6% de diferencia de tamaño.
+#   Más pasos = más preciso pero más lento. 10 es el balance correcto.
+SCALE_MIN   = 0.7
+SCALE_MAX   = 1.3
+# 6 pasos = escalas: 0.70, 0.82, 0.94, 1.06, 1.18, 1.30
+# Menos pasos = matching más rápido. 6 cubre bien el rango de zoom de Exnova.
+# Si necesitás más precisión subí a 8. Nunca más de 12 o el loop se atrasa.
+SCALE_STEPS = 6
 
 # Límites finales calculados automáticamente.
 # X_MIN = 1438 - 120 = 1318  (hasta acá a la izquierda aceptamos el triángulo)
@@ -149,6 +197,13 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 # Evita que el bot dispare múltiples veces sobre la misma señal.
 # 60s = una vela completa de margen antes de volver a escanear.
 TIEMPO_BLOQUEO = 60
+
+# --- NOMBRE DEL PROCESO DE EXNOVA ---
+# Nombre exacto del .EXE tal como aparece en el Administrador de Tareas.
+# El bot busca este proceso al iniciar para encontrar su ventana.
+# Si no lo encontrás, abrí el Administrador de Tareas → pestaña Procesos
+# → click derecho sobre Exnova → "Ir a detalles" → copiá el nombre exacto.
+EXNOVA_PROCESO = "Exnova.exe"  # ← ajustá si el nombre es distinto
 
 # =============================================================================
 # CARGA Y VALIDACIÓN DE ASSETS (imágenes de señales)
@@ -204,10 +259,39 @@ TEMPLATE_ROJO  = cargar_template('rojo.png')
 
 _lock = threading.Lock()
 
+# --- BUFFER DE DEBUG VISUAL ---
+# El hilo de detección escribe el frame procesado acá.
+# El hilo de display lo lee y lo muestra.
+# Son hilos distintos: la detección nunca espera al display.
+#
+# ¿Por qué un dict con lock y no una variable global?
+# Porque dos hilos accediendo a la misma variable sin sincronización
+# pueden causar que uno lea un frame a medio escribir → crash o imagen corrupta.
+_debug_buffer = {"frame": None}
+_debug_lock   = threading.Lock()
+
+def set_debug_frame(frame):
+    """Escribe el último frame procesado. Thread-safe."""
+    with _debug_lock:
+        _debug_buffer["frame"] = frame
+
+def get_debug_frame():
+    """Lee el último frame disponible. Devuelve None si todavía no hay ninguno."""
+    with _debug_lock:
+        return _debug_buffer["frame"]
+
 # Variables de estado envueltas en funciones para acceso seguro
 _estado = {
     "operacion_bloqueada": False,  # ¿Acabamos de operar y esperamos el reset?
     "ultima_senal_tiempo": 0.0,    # Timestamp de la última operación (float de Unix time)
+
+    # --- DETECCIÓN DE SEÑAL NUEVA ---
+    # Guardamos si había señal en el frame anterior.
+    # Si antes NO había y ahora SÍ hay → señal nueva → válida para operar.
+    # Si antes YA había y ahora sigue → señal vieja → ignorar.
+    # Este es el mecanismo clave para no operar sobre triángulos del pasado.
+    "habia_verde_antes": False,
+    "habia_rojo_antes":  False,
 }
 
 def get_estado(clave: str):
@@ -228,68 +312,147 @@ def set_estado(clave: str, valor):
 
 class OverlayHUD:
     """
-    Ventana transparente que se dibuja encima de todo como un HUD.
-    
-    ¿Por qué una clase?
-    → Porque agrupa datos (labels, ventana) + comportamiento (actualizar)
-      en un solo lugar. Más ordenado que variables sueltas.
+    Overlay transparente que se dibuja ENCIMA de Exnova, sin ventana separada.
+
+    Dibuja directamente sobre la pantalla:
+      - Rectángulo naranja = zona válida de la última vela
+      - Círculo           = señal detectada (verde=compra, rojo=venta)
+      - Texto HUD         = estado del bot y valores de debug
+
+    ¿Por qué Canvas en lugar de Labels?
+    → Los Labels solo muestran texto. El Canvas permite dibujar
+      formas (rectángulos, círculos, líneas) en coordenadas absolutas.
+    → Combinado con la ventana transparente, el Canvas se convierte
+      en un overlay de dibujo directo sobre la pantalla.
+
+    ¿Por qué no hay lag?
+    → No movemos imágenes de la pantalla. Solo redibujamos formas simples
+      (vectores) en cada frame. Es extremadamente rápido comparado con
+      capturar, procesar y mostrar una imagen completa en otra ventana.
     """
-    
+
+    # Color transparente: cualquier píxel de este color desaparece.
+    # Usamos un magenta muy específico para no chocar con colores de Exnova.
+    TRANSPARENTE = "#ff00ff"
+
     def __init__(self):
         self.root = tk.Tk()
-        
-        # bg='magenta' + transparentcolor='magenta' → el magenta se vuelve transparente.
-        # Es el truco clásico para ventanas overlay: pintamos el fondo de un color
-        # que después hacemos invisible. Lo que queda visible son solo los labels.
-        self.root.config(bg='magenta')
-        self.root.attributes(
-            "-transparentcolor", "magenta",  # Este color se vuelve transparente
-            "-topmost", True                 # La ventana siempre queda arriba de todo
-        )
-        self.root.overrideredirect(True)  # Quitamos la barra de título y bordes de Windows
-        self.root.geometry("400x120+100+100")  # Tamaño (400x120) y posición (+100+100)
-        
-        # Label principal: muestra el estado del bot
-        self.label_status = tk.Label(
+
+        # Ventana sin bordes, siempre arriba, cubre toda la pantalla
+        self.root.overrideredirect(True)           # Sin barra de título ni bordes
+        self.root.attributes("-topmost", True)      # Siempre encima de todo
+        self.root.attributes("-transparentcolor", self.TRANSPARENTE)  # Transparencia
+        self.root.geometry("1920x1080+0+0")         # Cubre pantalla completa 1920x1080
+        self.root.config(bg=self.TRANSPARENTE)      # Fondo invisible
+
+        # Canvas del tamaño de la pantalla completa.
+        # El Canvas es el "lienzo" donde dibujamos todo.
+        # highlightthickness=0 elimina el borde del Canvas que tkinter agrega por defecto.
+        self.canvas = tk.Canvas(
             self.root,
-            text="🤖 BOT: STANDBY",
-            font=("Consolas", 14, "bold"),
-            fg="#00FF00",   # Verde brillante (fácil de leer sobre cualquier fondo)
-            bg="magenta"    # Mismo color que el fondo → se ve transparente
+            width=1920, height=1080,
+            bg=self.TRANSPARENTE,
+            highlightthickness=0
         )
-        self.label_status.pack(anchor="w")  # anchor="w" = alineado a la izquierda (West)
-        
-        # Label secundario: muestra valores de debug en tiempo real
-        self.label_debug = tk.Label(
-            self.root,
-            text="Iniciando...",
-            font=("Consolas", 10),
-            fg="white",
-            bg="magenta"
+        self.canvas.pack()
+
+        # IDs de los elementos dibujados en el canvas.
+        # Los guardamos para poder actualizarlos sin borrar y redibujar todo.
+        # None = todavía no dibujado.
+        self._id_zona     = None   # Rectángulo naranja de zona válida
+        self._id_senal    = None   # Círculo de señal detectada
+        self._id_status   = None   # Texto de estado del bot
+        self._id_debug    = None   # Texto de valores debug
+
+        # Dibujamos los elementos estáticos que no cambian (zona válida)
+        self._dibujar_zona_valida()
+
+    def _dibujar_zona_valida(self):
+        """
+        Dibuja el rectángulo naranja de zona válida.
+        Es estático: se dibuja una vez al inicio y no cambia.
+        Solo cambia si el usuario ajusta ZONA_VELA_ACTUAL_X_MIN/MAX.
+        """
+        self._id_zona = self.canvas.create_rectangle(
+            ZONA_VELA_ACTUAL_X_MIN, 0,          # Esquina superior izquierda
+            ZONA_VELA_ACTUAL_X_MAX, 1080,        # Esquina inferior derecha
+            outline="#FF8C00",                   # Color del borde: naranja oscuro
+            fill="",                             # Sin relleno (solo borde)
+            width=2                              # Grosor del borde
         )
-        self.label_debug.pack(anchor="w")
-    
-    def actualizar(self, status: str, debug: str):
+        self.canvas.create_text(
+            ZONA_VELA_ACTUAL_X_MIN + 5, 20,
+            text="ZONA VÁLIDA",
+            anchor="nw",                         # Ancla en esquina superior izquierda
+            fill="#FF8C00",
+            font=("Consolas", 9, "bold")
+        )
+
+    def actualizar(self, status: str, debug: str,
+                   senal_x: int = -1, senal_y: int = -1, senal_color: str = ""):
         """
-        Método público para actualizar el HUD desde cualquier hilo.
-        
-        ¿Por qué usar self.root.after(0, ...)?
-        → tkinter NO es thread-safe. Si llamamos .config() directamente desde
-          otro hilo, puede crashear de forma silenciosa o impredecible.
-        → root.after(0, función) le dice a tkinter: "ejecutá esta función
-          en el hilo principal tan pronto como puedas".
-        → El "0" significa "sin delay adicional, lo antes posible".
-        → Así la UI siempre se actualiza desde su propio hilo. Seguro.
+        Actualiza el overlay desde cualquier hilo de forma thread-safe.
+
+        Parámetros nuevos respecto a la versión anterior:
+          senal_x, senal_y  → coordenadas donde dibujar el círculo de señal
+                              -1 significa "no hay señal, borrar el círculo"
+          senal_color       → "verde" o "rojo" según la señal detectada
         """
-        self.root.after(0, lambda: self._actualizar_ui(status, debug))
-    
-    def _actualizar_ui(self, status: str, debug: str):
+        # Empaquetamos todos los datos en una tupla para pasarlos al hilo principal.
+        # Lambda captura la tupla completa para evitar problemas de closure en loops.
+        datos = (status, debug, senal_x, senal_y, senal_color)
+        self.root.after(0, lambda d=datos: self._actualizar_ui(*d))
+
+    def _actualizar_ui(self, status: str, debug: str,
+                       senal_x: int, senal_y: int, senal_color: str):
         """
-        Actualización real de los labels. Solo llamar desde el hilo principal.
-        El guión bajo al inicio (_) es convención Python para "método interno/privado".
+        Actualización real del canvas. Solo se ejecuta en el hilo principal de tkinter.
+
+        Estrategia de actualización:
+        → Borramos el círculo y textos anteriores con canvas.delete(id)
+        → Redibujamos con los nuevos valores
+        → NO borramos la zona naranja (es estática, no cambia cada frame)
+
+        Borrar y redibujar solo los elementos que cambian es más eficiente
+        que hacer canvas.delete("all") y redibujar todo desde cero cada frame.
         """
-        self.label_status.config(text=status)
-        self.label_debug.config(text=debug)
+        # --- Texto de estado ---
+        if self._id_status:
+            self.canvas.delete(self._id_status)   # Borramos el texto anterior
+        color_status = "#00FF00" if "ESCANEANDO" in status else "#FF4444"
+        self._id_status = self.canvas.create_text(
+            10, 10, anchor="nw",
+            text=status,
+            fill=color_status,
+            font=("Consolas", 13, "bold")
+        )
+
+        # --- Texto de debug ---
+        if self._id_debug:
+            self.canvas.delete(self._id_debug)
+        self._id_debug = self.canvas.create_text(
+            10, 32, anchor="nw",
+            text=debug,
+            fill="white",
+            font=("Consolas", 10)
+        )
+
+        # --- Círculo de señal ---
+        if self._id_senal:
+            self.canvas.delete(self._id_senal)    # Borramos el círculo anterior
+            self._id_senal = None
+
+        if senal_x >= 0 and senal_y >= 0:
+            # Solo dibujamos si hay señal activa (coordenadas válidas)
+            color_circulo = "#00FF00" if senal_color == "verde" else "#FF0000"
+            r = 22   # Radio del círculo en píxeles
+            self._id_senal = self.canvas.create_oval(
+                senal_x - r, senal_y - r,    # Esquina superior izquierda del bounding box
+                senal_x + r, senal_y + r,    # Esquina inferior derecha
+                outline=color_circulo,
+                fill="",                      # Sin relleno
+                width=3
+            )
 
 
 # Instanciamos el HUD. Esto crea la ventana pero no la muestra hasta el mainloop().
@@ -332,63 +495,213 @@ def click_pro(x: int, y: int):
 def obtener_segundos_restantes() -> int:
     """
     Captura la zona del reloj en pantalla y extrae el número de segundos via OCR.
-    
-    Devuelve un int con los segundos, o 0 si no pudo leer nada.
-    El '-> int' es un type hint: documentamos qué tipo devuelve la función.
+
+    El reloj de Exnova muestra el tiempo en formato MM:SS → ej: "00:56", "00:31"
+    Nosotros solo necesitamos los SEGUNDOS (los últimos 2 dígitos).
+
+    Devuelve un int con los segundos, o -1 si no pudo leer nada.
+    Devolvemos -1 en lugar de 0 para distinguir "falló el OCR" de "realmente hay 0 segundos".
     """
     try:
         with mss.MSS() as sct:
-            # Capturamos SOLO el área del reloj, no toda la pantalla.
-            # Esto es mucho más rápido y el OCR comete menos errores
-            # porque tiene menos "ruido visual" alrededor.
             screenshot = np.array(sct.grab(AREA_RELOJ))
-            
-            # Convertimos a escala de grises.
-            # El OCR funciona mejor en grises que en color:
-            # elimina información que no necesita (color) y es más rápido.
-            gray = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
-            
-            # Agrandamos la imagen x2 con interpolación cúbica.
-            # Tesseract trabaja mejor con texto grande. Si el reloj es pequeño
-            # en pantalla, los caracteres tienen pocos píxeles y el OCR falla.
-            # INTER_CUBIC es más lento que INTER_LINEAR pero da mejor calidad al agrandar.
-            gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-            
-            # Binarización (threshold): convertimos la imagen a blanco y negro puro.
-            # THRESH_BINARY_INV invierte los colores: texto oscuro → blanco, fondo → negro.
-            # Tesseract lee mejor texto blanco sobre negro en imágenes binarizadas.
-            # 180 es el umbral: píxeles más claros que 180 → negro; más oscuros → blanco.
-            _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-            
-            # Configuración de Tesseract:
-            # --psm 7 = "tratar la imagen como una sola línea de texto"
-            #           (perfecto para un reloj que muestra "0:31" o "31")
-            # tessedit_char_whitelist = solo reconocer estos caracteres
-            #           (ignorar letras, signos raros que confunden el OCR)
-            config_ocr = '--psm 7 -c tessedit_char_whitelist=0123456789:'
-            texto = pytesseract.image_to_string(thresh, config=config_ocr).strip()
-            
-            # Filtramos todo lo que no sea dígito.
-            # .strip() ya quitó espacios, pero pueden quedar caracteres raros.
-            texto_filtrado = "".join(filter(str.isdigit, texto))
-            
-            # Tomamos los últimos 2 dígitos como los segundos.
-            # Si el reloj muestra "1:31", texto_filtrado = "131" → tomamos "31".
-            # Si muestra "31", texto_filtrado = "31" → tomamos "31".
-            if len(texto_filtrado) >= 2:
-                return int(texto_filtrado[-2:])  # [-2:] = últimos 2 caracteres
-            elif len(texto_filtrado) == 1:
-                return int(texto_filtrado)
-                
+
+            # mss captura en BGRA (4 canales) → convertimos a grises (1 canal)
+            # Pasamos por BGR primero para evitar errores de conversión directa
+            gray = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2GRAY)
+
+            # Agrandamos x3 en lugar de x2.
+            # El reloj de Exnova tiene texto relativamente pequeño (height=35px).
+            # Con x3 los dígitos quedan más grandes y Tesseract los lee mejor.
+            # INTER_CUBIC = interpolación de alta calidad al agrandar.
+            gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+
+            # Intentamos DOS métodos de binarización y nos quedamos con el que funcione.
+            # ¿Por qué dos métodos?
+            # → El reloj de Exnova puede tener texto blanco sobre fondo oscuro
+            #   O texto amarillo/dorado sobre fondo negro según el estado.
+            # → THRESH_BINARY_INV funciona bien para texto claro sobre fondo oscuro.
+            # → THRESH_OTSU calcula automáticamente el umbral óptimo para la imagen actual.
+            #   Es más robusto ante cambios de brillo/color del reloj.
+
+            # Método 1: Otsu (automático, más robusto)
+            _, thresh_otsu = cv2.threshold(
+                gray, 0, 255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                # THRESH_OTSU analiza el histograma de la imagen y elige
+                # automáticamente el mejor valor de corte entre claro y oscuro.
+                # El "0" como umbral es ignorado cuando se usa OTSU.
+            )
+
+            # Método 2: Inversión fija (texto claro sobre fondo oscuro)
+            _, thresh_inv = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+
+            config_ocr = (
+                '--psm 7 '                              # Imagen = una sola línea de texto
+                '--oem 3 '                              # Motor OCR: LSTM (más preciso)
+                '-c tessedit_char_whitelist=0123456789:'# Solo leer dígitos y dos puntos
+            )
+
+            # Probamos ambos thresholds y nos quedamos con el que dé un resultado válido
+            for thresh in (thresh_otsu, thresh_inv):
+                texto = pytesseract.image_to_string(thresh, config=config_ocr).strip()
+
+                # Log de debug: muestra qué está leyendo el OCR en cada frame.
+                # Muy útil para calibrar. Una vez que funcione bien, podés
+                # cambiar logger.debug por pass para silenciarlo.
+                logger.debug(f"OCR raw: '{texto}'")
+
+                # Extraemos solo los dígitos del texto leído
+                digitos = "".join(filter(str.isdigit, texto))
+
+                # El reloj muestra "MM:SS" → después de filtrar dígitos tenemos "MMSS"
+                # Ejemplo: "00:56" → "0056" → últimos 2 = "56" → 56 segundos
+                # Ejemplo: "00:05" → "0005" → últimos 2 = "05" → 5 segundos
+                # Necesitamos al menos 2 dígitos para extraer los segundos
+                if len(digitos) >= 2:
+                    segundos = int(digitos[-2:])
+                    # Validamos que sea un valor de segundos razonable (0-59)
+                    if 0 <= segundos <= 59:
+                        return segundos
+
+        # Si ningún método funcionó, retornamos -1 como señal de fallo
+        logger.warning("OCR no pudo leer el reloj en ningún intento.")
+        return -1
+
     except Exception as e:
-        # Ahora el error es visible. Antes se tragaba silenciosamente.
-        logger.warning(f"OCR falló: {e}")
-    
-    return 0  # Valor neutro si no pudimos leer el reloj
+        logger.warning(f"OCR excepción: {e}")
+        return -1
 
 # =============================================================================
 # LOOP PRINCIPAL: VISIÓN + LÓGICA DE TRADING
 # =============================================================================
+
+def obtener_ventana_exnova() -> dict | None:
+    """
+    Busca la ventana del proceso Exnova.exe y devuelve su región de pantalla.
+
+    Estrategia:
+    1. Buscamos en todos los procesos activos el que se llama EXNOVA_PROCESO
+    2. Con el PID encontrado, buscamos el HWND (handle de ventana) de Windows
+    3. Con el HWND obtenemos las coordenadas exactas de la ventana
+    4. Devolvemos esas coordenadas como diccionario compatible con mss
+
+    ¿Por qué buscar por proceso y no por título de ventana?
+    → El título puede cambiar según el par de divisas seleccionado
+      (ej: "EUR/USD - Exnova", "AIG - Exnova"). El nombre del .EXE es fijo.
+
+    Devuelve dict {"top": y, "left": x, "width": w, "height": h}
+    o None si Exnova no está corriendo.
+    """
+    # Paso 1: buscar el PID del proceso Exnova
+    pid_exnova = None
+    for proc in psutil.process_iter(['pid', 'name']):
+        # Comparamos en minúsculas para evitar problemas con mayúsculas
+        if proc.info['name'].lower() == EXNOVA_PROCESO.lower():
+            pid_exnova = proc.info['pid']
+            break
+
+    if pid_exnova is None:
+        logger.warning(f"Proceso '{EXNOVA_PROCESO}' no encontrado. ¿Está Exnova abierto?")
+        return None
+
+    logger.info(f"Exnova encontrado → PID: {pid_exnova}")
+
+    # Paso 2: buscar el HWND (handle) de la ventana asociada a ese PID
+    # win32gui.EnumWindows recorre TODAS las ventanas abiertas y llama
+    # a nuestra función callback por cada una.
+    hwnd_encontrado = None
+
+    def callback_ventana(hwnd, _):
+        nonlocal hwnd_encontrado
+        try:
+            # Obtenemos el PID del proceso dueño de esta ventana
+            _, pid_ventana = win32process.GetWindowThreadProcessId(hwnd)
+            if pid_ventana == pid_exnova and win32gui.IsWindowVisible(hwnd):
+                # Verificamos que tenga título (descarta ventanas fantasma internas)
+                if win32gui.GetWindowText(hwnd):
+                    hwnd_encontrado = hwnd
+        except Exception:
+            pass  # Algunas ventanas del sistema no permiten ser inspeccionadas
+        return True  # Siempre seguimos enumerando — no retornamos False
+
+    try:
+        win32gui.EnumWindows(callback_ventana, None)
+    except Exception:
+        # pywin32 puede lanzar error si el callback lanza internamente.
+        # Lo ignoramos — si hwnd_encontrado tiene valor, funcionó igual.
+        pass
+
+    if hwnd_encontrado is None:
+        logger.warning("Exnova está corriendo pero no tiene ventana visible.")
+        return None
+
+    # Paso 3: obtener las coordenadas de la ventana
+    # GetWindowRect devuelve (left, top, right, bottom) en píxeles de pantalla
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd_encontrado)
+    width  = right - left
+    height = bottom - top
+
+    logger.info(f"Ventana Exnova → posición: ({left}, {top}) tamaño: {width}x{height}px")
+
+    return {
+        "hwnd":   hwnd_encontrado,
+        "top":    top,
+        "left":   left,
+        "width":  width,
+        "height": height
+    }
+
+
+def foco_exnova(hwnd: int):
+    """
+    Trae la ventana de Exnova al frente sin minimizarla ni moverla.
+    La llamamos una vez al inicio para asegurarnos de que está visible.
+
+    ¿Por qué no lo hacemos cada frame?
+    → Traer una ventana al frente en cada captura robaría el foco del mouse
+      y haría imposible usar otras ventanas mientras el bot corre.
+      Una sola vez al inicio es suficiente.
+    """
+    # ShowWindow con SW_RESTORE: si está minimizada la restaura, si no la deja igual
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    # SetForegroundWindow: la trae al frente
+    win32gui.SetForegroundWindow(hwnd)
+    logger.info("Foco enviado a la ventana de Exnova.")
+
+
+def hilo_debug_display():
+    """
+    Hilo dedicado exclusivamente a mostrar la ventana de debug.
+
+    ¿Por qué un hilo separado?
+    → El cv2.imshow() bloquea el hilo que lo llama mientras renderiza el frame.
+    → Si está en el mismo hilo que la detección, cada render bloquea el bot
+      entre 20-50ms, haciendo que pierda señales que aparecen en ese intervalo.
+    → Separándolo, el hilo de detección corre sin interrupciones.
+      El display toma el último frame disponible y lo muestra a su propio ritmo.
+
+    Este hilo corre a 60fps para una visualización fluida del debug.
+    vea qué está pasando. No afecta en nada la velocidad de detección.
+    """
+    logger.info("Hilo de debug display iniciado.")
+    cv2.namedWindow("Debug Vision", cv2.WINDOW_NORMAL)
+
+    while True:
+        frame = get_debug_frame()  # Lee el último frame procesado
+
+        if frame is not None:
+            cv2.imshow("Debug Vision", frame)
+
+        # waitKey es obligatorio para que OpenCV procese eventos de la ventana.
+        # 16ms = ~60fps para el display. Completamente independiente del loop principal.
+        # Si el usuario presiona 'q', cerramos la ventana de debug.
+        key = cv2.waitKey(16)
+        if key == ord('q'):
+            cv2.destroyWindow("Debug Vision")
+            logger.info("Ventana de debug cerrada por el usuario.")
+            break
+
 
 def buscar_y_operar():
     """
@@ -399,28 +712,58 @@ def buscar_y_operar():
     
     # Creamos la ventana de debug una sola vez, fuera del loop.
     # Si la creáramos dentro del loop, crearíamos miles de ventanas.
-    cv2.namedWindow("Debug Vision", cv2.WINDOW_NORMAL)
-    
+    # La ventana de debug se crea en su propio hilo (hilo_debug_display).
+    # Acá solo nos ocupamos de capturar y procesar.
+
     # 'with mss.MSS() as sct' abre el capturador de pantalla.
     # El 'with' garantiza que mss se cierre correctamente aunque haya un error.
     # Es mejor que llamar sct.close() manualmente (que podríamos olvidar).
     with mss.MSS() as sct:
         
-        monitor = sct.monitors[1]  # monitors[0] = todos los monitores juntos
-                                   # monitors[1] = primer monitor (el principal)
-                                   # monitors[2] = segundo monitor (si existe)
-        
+        # Buscamos la ventana de Exnova al iniciar el bot
+        info_ventana = obtener_ventana_exnova()
+        if info_ventana is None:
+            logger.error("No se pudo encontrar Exnova. Cerrando bot.")
+            return
+
+        # Traemos Exnova al frente una sola vez al inicio
+        foco_exnova(info_ventana["hwnd"])
+        time.sleep(0.5)  # Pequeña pausa para que el SO procese el cambio de foco
+
+        # Región de captura: solo la ventana de Exnova
+        # mss acepta el mismo formato de dict que ya teníamos para AREA_RELOJ
+        region_exnova = {
+            "top":    info_ventana["top"],
+            "left":   info_ventana["left"],
+            "width":  info_ventana["width"],
+            "height": info_ventana["height"],
+        }
+
         while True:  # Loop infinito: el bot corre hasta que lo cerremos
-            
+
             # --- MEDICIÓN DE TIEMPO DEL LOOP ---
-            # Guardamos el tiempo al inicio de cada iteración.
-            # Al final calculamos cuánto tardó y ajustamos el sleep.
-            # Así el bot siempre intenta correr a ~20fps sin importar
-            # cuánto tarde el template matching en cada frame.
             loop_start = time.time()
-            
-            # --- CAPTURA DE PANTALLA ---
-            img = np.array(sct.grab(monitor))  # Captura full screen como array NumPy (BGRA)
+
+            # --- CAPTURA SOLO DE LA VENTANA EXNOVA ---
+            # En lugar de capturar toda la pantalla (1920x1080),
+            # capturamos solo el área de la ventana de Exnova.
+            # Si Exnova está en 1456x816, procesamos un 44% menos de píxeles
+            # → matchTemplate es proporcionalmente más rápido.
+            #
+            # IMPORTANTE: si el usuario mueve la ventana de Exnova durante
+            # la sesión, las coordenadas quedan desactualizadas.
+            # Por eso re-consultamos la posición cada 5 segundos.
+            if int(time.time()) % 5 == 0:
+                nueva_info = obtener_ventana_exnova()
+                if nueva_info:
+                    region_exnova = {
+                        "top":    nueva_info["top"],
+                        "left":   nueva_info["left"],
+                        "width":  nueva_info["width"],
+                        "height": nueva_info["height"],
+                    }
+
+            img = np.array(sct.grab(region_exnova))  # Captura solo Exnova (BGRA)
 
             # Convertimos BGRA → BGR para el template matching en color.
             # mss captura con canal Alpha (transparencia) incluido = BGRA (4 canales).
@@ -433,7 +776,15 @@ def buscar_y_operar():
             # Mostrar en grises en el debug es más claro para ver la zona naranja
             # y los círculos encima. No se usa para el matching.
             img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            
+
+            # Enviamos el frame RAW al buffer de debug INMEDIATAMENTE después
+            # de capturar — antes de cualquier procesamiento.
+            # Así el hilo de display siempre tiene el frame más reciente
+            # sin esperar los ~150ms que tarda el multi-scale matching.
+            # Los indicadores (zona, círculos) se dibujan después y se
+            # envían como segundo frame, pero el display ya avanzó.
+            set_debug_frame(cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR))
+
             # --- BÚSQUEDA DE SEÑALES (Template Matching) ---
             # Inicializamos con valores neutros.
             # Si operacion_bloqueada=True, saltamos el matching completo para ahorrar CPU.
@@ -441,47 +792,100 @@ def buscar_y_operar():
             max_v, max_r = 0.0, 0.0
             loc_v, loc_r = (0, 0), (0, 0)
             
+            # --- BÚSQUEDA DE SEÑALES EN ZONA VÁLIDA ---
+            #
+            # Lógica simple y directa:
+            #   1. Corremos matchTemplate sobre toda la imagen
+            #   2. Buscamos TODAS las coincidencias que superen el umbral
+            #   3. De esas, nos quedamos SOLO con las que estén dentro de la zona válida
+            #   4. Si hay alguna dentro → señal válida. Si no hay → ignoramos.
+            #
+            # ¿Por qué np.where en lugar de minMaxLoc?
+            # minMaxLoc devuelve UNA SOLA coincidencia (la de mayor confianza).
+            # Si esa coincidencia es una señal vieja fuera de la zona → falla.
+            # np.where devuelve TODAS → podemos filtrar por zona y elegir la mejor.
+
+            def buscar_multiscala(template: np.ndarray, imagen: np.ndarray) -> tuple:
+                """
+                Busca el template a múltiples escalas dentro de la zona válida.
+
+                ¿Por qué múltiples escalas?
+                → El zoom de Exnova cambia el tamaño de los triángulos en pantalla.
+                → matchTemplate requiere que template e imagen tengan el mismo tamaño
+                  de objeto. Si difieren aunque sea un 10%, la confianza cae a ~0.3.
+                → Probando escalas entre SCALE_MIN y SCALE_MAX encontramos el tamaño
+                  real del triángulo en pantalla, sin importar el zoom actual.
+
+                Proceso por cada escala:
+                  1. Redimensionamos el template a esa escala
+                  2. Corremos matchTemplate sobre la imagen completa
+                  3. Filtramos resultados dentro de la zona válida
+                  4. Guardamos la mejor coincidencia de todas las escalas
+
+                Devuelve (confianza, (x, y), escala_ganadora)
+                o (0.0, (0,0), 1.0) si no encontró nada.
+                """
+                mejor_conf  = 0.0
+                mejor_loc   = (0, 0)
+                mejor_escala = 1.0
+
+                # Generamos las escalas a probar de forma uniforme entre min y max
+                # np.linspace(0.7, 1.3, 10) = [0.7, 0.77, 0.83, ..., 1.3]
+                escalas = np.linspace(SCALE_MIN, SCALE_MAX, SCALE_STEPS)
+
+                h_orig, w_orig = template.shape[:2]
+
+                for escala in escalas:
+                    # Calculamos el nuevo tamaño del template para esta escala
+                    nuevo_w = int(w_orig * escala)
+                    nuevo_h = int(h_orig * escala)
+
+                    # El template redimensionado no puede ser más grande que la imagen
+                    if nuevo_w >= imagen.shape[1] or nuevo_h >= imagen.shape[0]:
+                        continue
+
+                    # Redimensionamos el template
+                    # INTER_AREA es el mejor algoritmo para reducir tamaño
+                    # INTER_CUBIC es el mejor para agrandar
+                    inter = cv2.INTER_AREA if escala < 1.0 else cv2.INTER_CUBIC
+                    t_escalado = cv2.resize(template, (nuevo_w, nuevo_h), interpolation=inter)
+
+                    # Corremos matchTemplate con este template escalado
+                    resultado = cv2.matchTemplate(imagen, t_escalado, cv2.TM_CCOEFF_NORMED)
+
+                    # Buscamos todos los puntos con confianza suficiente
+                    filas, cols = np.where(resultado >= UMBRAL_CONFIANZA)
+
+                    for y, x in zip(filas.tolist(), cols.tolist()):
+                        # FILTRO PRINCIPAL: solo dentro de la zona válida
+                        if not (ZONA_VELA_ACTUAL_X_MIN <= x <= ZONA_VELA_ACTUAL_X_MAX):
+                            continue
+
+                        conf = float(resultado[y, x])
+                        if conf > mejor_conf:
+                            mejor_conf   = conf
+                            mejor_loc    = (x, y)
+                            mejor_escala = escala
+
+                if mejor_conf > 0:
+                    logger.debug(
+                        f"Detección → conf:{mejor_conf:.2f} "
+                        f"pos:{mejor_loc} escala:{mejor_escala:.2f}x"
+                    )
+
+                return mejor_conf, mejor_loc
+
+            # Valores por defecto
+            max_v, loc_v = 0.0, (0, 0)
+            max_r, loc_r = 0.0, (0, 0)
+
             if not get_estado("operacion_bloqueada"):
-                # matchTemplate recorre img_gray píxel por píxel buscando el template.
-                # TM_CCOEFF_NORMED normaliza el resultado entre -1.0 y 1.0.
-                # 1.0 = coincidencia perfecta | 0.0 = sin parecido | -1.0 = inverso
-                # Usamos img_bgr (color) para que OpenCV pueda distinguir
-                # el triángulo VERDE del ROJO. En grises son indistinguibles.
-                res_v = cv2.matchTemplate(img_bgr, TEMPLATE_VERDE, cv2.TM_CCOEFF_NORMED)
-                res_r = cv2.matchTemplate(img_bgr, TEMPLATE_ROJO,  cv2.TM_CCOEFF_NORMED)
-                
-                # minMaxLoc devuelve (min_val, max_val, min_loc, max_loc)
-                # Solo nos importan:
-                #   max_v / max_r → nivel de confianza de la mejor coincidencia
-                #   loc_v / loc_r → posición (x, y) de esa mejor coincidencia
-                _, max_v, _, loc_v = cv2.minMaxLoc(res_v)
-                _, max_r, _, loc_r = cv2.minMaxLoc(res_r)
-            
-            # --- FILTRO DE ZONA: ÚLTIMA VELA ---
-            # Esta es la regla más importante del bot:
-            # "Solo operar si la señal está en la última vela"
-            #
-            # Implementación: verificamos que la coordenada X del triángulo
-            # esté dentro de ZONA_VELA_ACTUAL_X_MIN y ZONA_VELA_ACTUAL_X_MAX.
-            # Esa franja cubre exactamente la zona de la última vela en tu pantalla.
-            #
-            # loc_v[0] y loc_r[0] son la coordenada X (horizontal) donde OpenCV
-            # encontró el template. [0] = X, [1] = Y (vertical).
-            #
-            # Condición completa para que una señal sea VÁLIDA:
-            #   1. Confianza >= umbral (la imagen se parece al template)
-            #   2. X >= ZONA_VELA_ACTUAL_X_MIN (no está en velas viejas)
-            #   3. X <= ZONA_VELA_ACTUAL_X_MAX (no está fuera del gráfico)
-            def en_zona_ultima_vela(loc: tuple) -> bool:
-                # Función auxiliar local: recibe una posición (x,y) y
-                # devuelve True si X está dentro de la zona válida.
-                # Definirla acá (dentro del loop) es válido para funciones pequeñas
-                # que solo se usan en este contexto.
-                x = loc[0]
-                return ZONA_VELA_ACTUAL_X_MIN <= x <= ZONA_VELA_ACTUAL_X_MAX
-            
-            hay_v = (max_v >= UMBRAL_CONFIANZA) and en_zona_ultima_vela(loc_v)
-            hay_r = (max_r >= UMBRAL_CONFIANZA) and en_zona_ultima_vela(loc_r)
+                max_v, loc_v = buscar_multiscala(TEMPLATE_VERDE, img_bgr)
+                max_r, loc_r = buscar_multiscala(TEMPLATE_ROJO,  img_bgr)
+
+            # Señal válida = confianza suficiente Y dentro de zona (ya filtrado adentro)
+            hay_v = max_v >= UMBRAL_CONFIANZA
+            hay_r = max_r >= UMBRAL_CONFIANZA
             
             # --- VISUALIZACIÓN DEBUG ---
             # Convertimos de gris a BGR para poder dibujar en colores.
@@ -534,9 +938,12 @@ def buscar_y_operar():
                 color = (0, 0, 255) if hay_r else (0, 0, 100)  # Rojo brillante si válida, oscuro si fuera de zona
                 cv2.circle(debug_img, (loc_r[0] + 15, loc_r[1] + 15), 20, color, 2)
             
-            cv2.imshow("Debug Vision", debug_img)
-            cv2.waitKey(1)  # waitKey(1) = procesar eventos de la ventana OpenCV por 1ms.
-                            # Sin esta línea la ventana se congela. Es OBLIGATORIO en el loop.
+            # Enviamos el frame al buffer compartido.
+            # El hilo de display lo leerá y mostrará de forma asíncrona.
+            # Este set_debug_frame() tarda ~0.01ms — prácticamente nada.
+            # Antes el imshow() bloqueaba ~30-50ms acá. Esa diferencia es
+            # exactamente el tiempo que el bot perdía señales.
+            set_debug_frame(debug_img)
             
             # --- LECTURA DEL RELOJ ---
             segundos = obtener_segundos_restantes()
@@ -555,7 +962,8 @@ def buscar_y_operar():
             # 2. No estamos en período de bloqueo post-operación
             # 3. Los segundos del reloj están en la ventana de trigger (30-32)
             #    (rango en lugar de valor exacto = más robusto ante fallas de OCR)
-            if (hay_v or hay_r) and not bloqueado:
+            # segundos == -1 significa que el OCR falló → no operamos
+            if (hay_v or hay_r) and not bloqueado and segundos != -1:
                 
                 if SEGUNDO_TRIGGER_MIN <= segundos <= SEGUNDO_TRIGGER_MAX:
                     
@@ -583,14 +991,30 @@ def buscar_y_operar():
                     set_estado("operacion_bloqueada", False)
                     logger.info("Bot reseteado — listo para nueva señal.")
             
-            # --- CONTROL DE FPS ---
+            # --- CONTROL DE CICLO ---
             # Calculamos cuánto tardó esta iteración completa.
             elapsed = time.time() - loop_start
-            
-            # TARGET_FRAME_TIME = 0.05s = 50ms = ~20fps
-            # Si el loop tardó menos de 50ms, dormimos la diferencia.
-            # Si tardó más de 50ms (PC lenta), max(0,...) evita sleep negativo.
-            TARGET_FRAME_TIME = 0.05
+
+            # TARGET_FRAME_TIME = 1.0s = 1 captura por segundo.
+            #
+            # ¿Por qué 1 segundo y no más rápido?
+            # Las señales de Exnova aparecen sobre velas de 1 minuto.
+            # Una señal que aparece no desaparece en menos de 1 segundo,
+            # así que 1 captura/segundo es suficiente para detectarla
+            # sin desperdiciar CPU en capturas innecesarias.
+            #
+            # Cuando integremos YOLO volvemos a evaluar este valor.
+            # Por ahora 1s es el balance correcto para matchTemplate.
+            #
+            # Si necesitás más reactividad en el futuro, bajá este valor:
+            #   0.5  → 2 capturas por segundo
+            #   0.25 → 4 capturas por segundo
+            # 0.1s = 10 capturas por segundo.
+            # Necesitamos reactividad para no perdernos señales nuevas
+            # que aparecen y se mueven rápido con la vela en formación.
+            # Con 1s dormíamos demasiado y el triángulo nuevo ya había
+            # salido de la zona válida cuando finalmente capturábamos.
+            TARGET_FRAME_TIME = 0.1
             time.sleep(max(0.0, TARGET_FRAME_TIME - elapsed))
 
 # =============================================================================
@@ -605,14 +1029,22 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("RoarBot iniciando...")
     logger.info("Ejecutá como ADMINISTRADOR para que los clicks funcionen.")
+    logger.info(f"Buscando proceso: {EXNOVA_PROCESO}")
     logger.info("=" * 50)
+    logger.info("Dependencias necesarias: pip install pywin32 psutil")
     
     # Lanzamos el loop de visión en un hilo separado.
     # daemon=True significa que este hilo muere automáticamente
     # cuando el programa principal (la UI) se cierra.
     # Sin daemon=True, cerrar la ventana no mataría el hilo de fondo.
+    # Hilo de detección: corre lo más rápido posible, sin display
     hilo_vision = threading.Thread(target=buscar_y_operar, daemon=True)
     hilo_vision.start()
+
+    # Hilo de display: corre a 60fps para visualización fluida.
+    # daemon=True → se cierra automáticamente cuando se cierra la ventana principal.
+    hilo_display = threading.Thread(target=hilo_debug_display, daemon=True)
+    hilo_display.start()
     
     # mainloop() arranca el loop de eventos de tkinter.
     # Esta línea BLOQUEA hasta que el usuario cierre la ventana.
