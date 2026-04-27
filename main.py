@@ -157,7 +157,7 @@ CENTRO_RELOJ_X = AREA_RELOJ["left"] + (AREA_RELOJ["width"] // 2)  # 1403 + 35 = 
 # CALIBRACIÓN:
 #   Bot ignora señales válidas      → aumentar este número
 #   Bot detecta señales de velas viejas → reducirlo
-TOLERANCIA_ZONA_PX = 350
+TOLERANCIA_ZONA_PX = 150
 
 # --- MULTI-SCALE MATCHING ---
 # El zoom de Exnova hace que los triángulos cambien de tamaño en pantalla.
@@ -237,8 +237,8 @@ def cargar_template(ruta: str) -> np.ndarray:
     return img
 
 # Cargamos los templates al inicio. Si alguno falla, el programa para con un mensaje claro.
-TEMPLATE_VERDE = cargar_template('verde.png')
-TEMPLATE_ROJO  = cargar_template('rojo.png')
+TEMPLATE_VERDE = cargar_template('TVERDE.png')
+TEMPLATE_ROJO  = cargar_template('TROJO.png')
 
 # =============================================================================
 # ESTADO COMPARTIDO ENTRE HILOS (Thread-Safe)
@@ -381,7 +381,7 @@ class OverlayHUD:
             width=2                              # Grosor del borde
         )
         self.canvas.create_text(
-            ZONA_VELA_ACTUAL_X_MIN + 5, 20,
+            ZONA_VELA_ACTUAL_X_MIN + 5, 5,
             text="ZONA VÁLIDA",
             anchor="nw",                         # Ancla en esquina superior izquierda
             fill="#FF8C00",
